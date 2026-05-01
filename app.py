@@ -3,35 +3,53 @@ from flask_cors import CORS
 import requests
 import json
 import re
+import os
 
 app = Flask(__name__, static_folder='static', static_url_path='')
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-import os
+# 🔐 Secure API key from environment
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+
+# -------------------------
+# JSON extractor (robust)
+# -------------------------
 def extract_json(text):
-    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(1))
-        except:
-            pass
+    if not text:
+        return None
+
+    # remove ```json blocks
+    text = re.sub(r"^```(?:json)?\s*", "", text.strip(), flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text)
+
+    try:
+        return json.loads(text)
+    except:
+        pass
+
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
         try:
             return json.loads(match.group(0))
         except:
-            pass
+            return None
+
     return None
 
+
+# -------------------------
+# Routes
+# -------------------------
 @app.route("/")
 def index():
-    return send_from_directory(app.static_folder, "login.html")
+    return "Manddle backend is running!"
+
 
 @app.route("/<path:path>")
 def static_files(path):
     return send_from_directory(app.static_folder, path)
+
 
 @app.route("/chat", methods=["POST", "OPTIONS"])
 def chat():
@@ -39,9 +57,7 @@ def chat():
         return jsonify({}), 200
 
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"type": "chat", "reply": "Invalid request"}), 400
+        data = request.get_json(silent=True) or {}
 
         message = data.get("message", "")
         history = data.get("history", [])
@@ -52,82 +68,117 @@ def chat():
         ai_name = profile.get("ai_name", "Manddle")
         interests = profile.get("interests", "general")
 
-        tasks_list_str = ""
+        # -------------------------
+        # Task context
+        # -------------------------
         if tasks:
             tasks_list_str = "Current tasks:\n" + "\n".join(
-                f"#{t['number']} [{t.get('period', 'daily')}] {t['title']} ({t.get('status', 'pending')})"
-                + (f" – {t['description']}" if t.get('description') else "")
-                for t in tasks
+                f"#{i+1} [{t.get('period','daily')}] {t.get('title','')} ({t.get('status','pending')})"
+                + (f" – {t.get('description')}" if t.get('description') else "")
+                for i, t in enumerate(tasks)
             )
         else:
             tasks_list_str = "No tasks yet."
 
+        # -------------------------
+        # System Prompt
+        # -------------------------
         system_prompt = f"""
-You are {ai_name}, a helpful productivity assistant.
+You are {ai_name}, a human-like productivity assistant.
 
 User: {user_name}
 Interests: {interests}
 
 {tasks_list_str}
 
-IMPORTANT: The numbers (#1, #2, …) are STABLE. Use them to edit tasks.
+IMPORTANT:
+- Task numbers (#1, #2...) are stable.
+- Use them to edit/delete tasks.
 
-You can respond with these JSON types:
+You must ALWAYS return JSON.
 
-1. Normal chat: {{"type": "chat", "reply": "..."}}
+Formats:
 
-2. Create a task (default period = "daily"):
-   {{"type": "task", "title": "...", "description": "...", "period": "daily/monthly/yearly", "reply": "..."}}
+1. Chat:
+{{"type": "chat", "reply": "..."}}
 
-3. Edit ANY field of a task (title, description, period, status):
-   {{"type": "edit_task", "task_number": <number>, "new_title": "...", "new_description": "...", "new_period": "daily/monthly/yearly", "new_status": "pending/completed", "reply": "..."}}
-   (include only the fields you want to change)
+2. Create task:
+{{"type": "task", "title": "...", "description": "...", "period": "daily/monthly/yearly", "reply": "..."}}
 
-4. Delete a task:
-   {{"type": "delete_task", "task_number": <number>, "reply": "..."}}
+3. Edit task:
+{{"type": "edit_task", "task_number": 1, "new_title": "...", "new_description": "...", "new_period": "daily/monthly/yearly", "new_status": "pending/completed", "reply": "..."}}
 
-5. Add extra info (appends to description):
-   {{"type": "add_info_task", "task_number": <number>, "additional_info": "...", "reply": "..."}}
+4. Delete task:
+{{"type": "delete_task", "task_number": 1, "reply": "..."}}
 
-Return ONLY valid JSON.
+5. Add info:
+{{"type": "add_info_task", "task_number": 1, "additional_info": "...", "reply": "..."}}
+
+NO markdown. ONLY JSON.
 """
 
         messages = [{"role": "system", "content": system_prompt}]
+
         for msg in history[-10:]:
-            messages.append({"role": msg["role"], "content": msg["text"]})
+            role = msg.get("role", "user")
+            content = msg.get("text", "")
+            if content:
+                messages.append({"role": role, "content": content})
+
         messages.append({"role": "user", "content": message})
 
+        # -------------------------
+        # API Call
+        # -------------------------
         response = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={"model": "llama-3.1-8b-instant", "messages": messages},
-            timeout=30
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "llama-3.1-8b-instant",
+                "messages": messages
+            },
+            timeout=40
         )
 
         if response.status_code != 200:
-            detail = response.text
-            print(f"Groq error {response.status_code}: {detail}")
-            return jsonify({"type": "chat", "reply": f"⚠️ AI error: {detail[:100]}"})
+            print("Groq Error:", response.text)
+            return jsonify({
+                "type": "chat",
+                "reply": "⚠️ AI error"
+            })
 
         result = response.json()
         ai_text = result["choices"][0]["message"]["content"]
-        print("AI:", ai_text)
+
+        print("AI RAW:", ai_text)
 
         parsed = extract_json(ai_text)
-        if parsed and "type" in parsed:
-            # Validate required fields
-            if parsed["type"] == "task" and "title" not in parsed:
-                parsed = {"type": "chat", "reply": parsed.get("reply", "Missing title")}
-            elif parsed["type"] in ("edit_task", "delete_task", "add_info_task") and "task_number" not in parsed:
-                parsed = {"type": "chat", "reply": parsed.get("reply", "Missing task number")}
+
+        if isinstance(parsed, dict) and "type" in parsed:
             return jsonify(parsed)
-        else:
-            return jsonify({"type": "chat", "reply": ai_text[:500]})
+
+        return jsonify({
+            "type": "chat",
+            "reply": ai_text[:500]
+        })
 
     except Exception as e:
-        print("Server error:", e)
-        return jsonify({"type": "chat", "reply": f"⚠️ Server error: {str(e)[:100]}"})
+        print("Server Error:", str(e))
+        return jsonify({
+            "type": "chat",
+            "reply": "⚠️ Server error"
+        })
 
+
+# -------------------------
+# 🚀 IMPORTANT: RENDER FIX
+# -------------------------
 if __name__ == "__main__":
-    print("🚀 Server at http://127.0.0.1:5000")
-    app.run(debug=True, host='127.0.0.1', port=5000)
+    print("🚀 Starting Manddle server...")
+
+    port = int(os.environ.get("PORT", 5000))
+
+    app.run(host="0.0.0.0", port=port)
