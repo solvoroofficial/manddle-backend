@@ -8,42 +8,44 @@ import os
 app = Flask(__name__, static_folder='static', static_url_path='')
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# 🔐 Secure API key from environment
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+MODEL_NAME = "llama-3.1-8b-instant"
 
 
-# -------------------------
-# JSON extractor (robust)
-# -------------------------
 def extract_json(text):
     if not text:
         return None
 
-    # remove ```json blocks
-    text = re.sub(r"^```(?:json)?\s*", "", text.strip(), flags=re.IGNORECASE)
+    text = text.strip()
+
+    # Remove markdown code fences if Groq returns them
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*```$", "", text)
 
+    # Try full parse first
     try:
         return json.loads(text)
     except:
         pass
 
+    # Try extracting the first JSON object
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
         try:
             return json.loads(match.group(0))
         except:
-            return None
+            pass
 
     return None
 
 
-# -------------------------
-# Routes
-# -------------------------
 @app.route("/")
 def index():
-    return "Manddle backend is running!"
+    # Keep the app identity: serve login page from static folder if present
+    try:
+        return send_from_directory(app.static_folder, "login.html")
+    except:
+        return "Manddle backend is running!"
 
 
 @app.route("/<path:path>")
@@ -57,6 +59,12 @@ def chat():
         return jsonify({}), 200
 
     try:
+        if not GROQ_API_KEY:
+            return jsonify({
+                "type": "chat",
+                "reply": "⚠️ GROQ_API_KEY is missing on the server."
+            }), 500
+
         data = request.get_json(silent=True) or {}
 
         message = data.get("message", "")
@@ -68,21 +76,16 @@ def chat():
         ai_name = profile.get("ai_name", "Manddle")
         interests = profile.get("interests", "general")
 
-        # -------------------------
         # Task context
-        # -------------------------
         if tasks:
             tasks_list_str = "Current tasks:\n" + "\n".join(
-                f"#{i+1} [{t.get('period','daily')}] {t.get('title','')} ({t.get('status','pending')})"
-                + (f" – {t.get('description')}" if t.get('description') else "")
+                f"#{i + 1} [{t.get('period', 'daily')}] {t.get('title', '')} ({t.get('status', 'pending')})"
+                + (f" – {t.get('description')}" if t.get("description") else "")
                 for i, t in enumerate(tasks)
             )
         else:
             tasks_list_str = "No tasks yet."
 
-        # -------------------------
-        # System Prompt
-        # -------------------------
         system_prompt = f"""
 You are {ai_name}, a human-like productivity assistant.
 
@@ -92,29 +95,29 @@ Interests: {interests}
 {tasks_list_str}
 
 IMPORTANT:
-- Task numbers (#1, #2...) are stable.
-- Use them to edit/delete tasks.
+- Task numbers (#1, #2, ...) are stable.
+- Use them to edit or delete tasks.
 
-You must ALWAYS return JSON.
+You must ALWAYS return valid JSON only.
 
-Formats:
+Allowed formats:
 
-1. Chat:
+1) Normal chat:
 {{"type": "chat", "reply": "..."}}
 
-2. Create task:
+2) Create task:
 {{"type": "task", "title": "...", "description": "...", "period": "daily/monthly/yearly", "reply": "..."}}
 
-3. Edit task:
+3) Edit task:
 {{"type": "edit_task", "task_number": 1, "new_title": "...", "new_description": "...", "new_period": "daily/monthly/yearly", "new_status": "pending/completed", "reply": "..."}}
 
-4. Delete task:
+4) Delete task:
 {{"type": "delete_task", "task_number": 1, "reply": "..."}}
 
-5. Add info:
+5) Add info to task:
 {{"type": "add_info_task", "task_number": 1, "additional_info": "...", "reply": "..."}}
 
-NO markdown. ONLY JSON.
+Do not output markdown. Do not output plain text outside JSON.
 """
 
         messages = [{"role": "system", "content": system_prompt}]
@@ -127,9 +130,6 @@ NO markdown. ONLY JSON.
 
         messages.append({"role": "user", "content": message})
 
-        # -------------------------
-        # API Call
-        # -------------------------
         response = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={
@@ -137,22 +137,22 @@ NO markdown. ONLY JSON.
                 "Content-Type": "application/json"
             },
             json={
-                "model": "llama-3.1-8b-instant",
-                "messages": messages
+                "model": MODEL_NAME,
+                "messages": messages,
+                "temperature": 0.7
             },
             timeout=40
         )
 
         if response.status_code != 200:
-            print("Groq Error:", response.text)
+            print("Groq error:", response.status_code, response.text)
             return jsonify({
                 "type": "chat",
                 "reply": "⚠️ AI error"
-            })
+            }), 500
 
         result = response.json()
         ai_text = result["choices"][0]["message"]["content"]
-
         print("AI RAW:", ai_text)
 
         parsed = extract_json(ai_text)
@@ -166,19 +166,14 @@ NO markdown. ONLY JSON.
         })
 
     except Exception as e:
-        print("Server Error:", str(e))
+        print("Server error:", str(e))
         return jsonify({
             "type": "chat",
-            "reply": "⚠️ Server error"
-        })
+            "reply": f"⚠️ Server error: {str(e)[:100]}"
+        }), 500
 
 
-# -------------------------
-# 🚀 IMPORTANT: RENDER FIX
-# -------------------------
 if __name__ == "__main__":
     print("🚀 Starting Manddle server...")
-
     port = int(os.environ.get("PORT", 5000))
-
     app.run(host="0.0.0.0", port=port)
